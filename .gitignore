@@ -1,41 +1,607 @@
-# Compiled Lua sources
-luac.out
+--=============================================================================
+-- All-in-one LÖVR 3D Voxel Sandbox (single file)
+-- Features: real 3D, chunked meshing, textures (optional), multiplayer (enet),
+-- crafting/inventory, save/load world.
+--=============================================================================
 
-# luarocks build files
-*.src.rock
-*.zip
-*.tar.gz
+-- CONFIG
+local WORLD_W = 64
+local WORLD_H = 32
+local WORLD_D = 64
+local CHUNK_SIZE = 8          -- size of a chunk in voxels (x and z)
+local MAX_VIEW_DISTANCE = 48
+local SAVE_FILE = "world_save.lua"
 
-# Object files
-*.o
-*.os
-*.ko
-*.obj
-*.elf
+local try_load_enet = true    -- attempt to require 'enet' for multiplayer
 
-# Precompiled Headers
-*.gch
-*.pch
+-- BLOCK PRESETS (id -> {name, color, textureIndex, solid})
+local BLOCKS = {
+  [0] = {name="Air", color={0,0,0}, solid=false},
+  [1] = {name="Grass", color={0.2,0.75,0.2}, solid=true},
+  [2] = {name="Dirt",  color={0.55,0.35,0.2}, solid=true},
+  [3] = {name="Stone", color={0.5,0.5,0.5}, solid=true},
+  [4] = {name="Sand",  color={0.94,0.89,0.69}, solid=true},
+  [5] = {name="Wood",  color={0.6,0.4,0.2}, solid=true},
+}
 
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
-*.def
-*.exp
+-- CRAFTING RECIPES (simple): {ingredientCounts} -> outputId
+local RECIPES = {
+  -- 4 wood -> crafting table (represented as wood for simplicity)
+  [{5..5}]=nil -- placeholder; we'll use a simple recipe function below
+}
+-- We'll implement a simple recipe list:
+local RECIPES_LIST = {
+  {requires = {[5]=4}, gives = {6,1},   name = "Plank (example)"} -- 6 is placeholder for a new block if added
+}
+-- For simplicity, we'll keep only existing block IDs in inventory for placement.
 
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
+-- STORAGE
+local world = nil  -- 3D array [x][y][z] integers
+local chunks = {}  -- mesh data and dirty flags per chunk keyed by cx_cz
+local textures = {} -- optional textures loaded from assets/textures/<id>.png
 
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
+-- CAMERA / PLAYER
+local player = {
+  x = WORLD_W/2, y = WORLD_H/2, z = WORLD_D/2,
+  yaw = 0, pitch = 0,
+  speed = 8,
+  fly = false,
+  height = 1.6
+}
 
+-- INVENTORY (simple counts)
+local inventory = {}
+for id,_ in pairs(BLOCKS) do
+  if id ~= 0 then inventory[id] = 20 else inventory[id] = 0 end
+end
+local selectedBlock = 1
+
+-- MULTIPLAYER (optional enet)
+local enet = nil
+local net_host = nil
+local net_peer = nil
+local is_server = false
+
+-- UTIL: clamp
+local function clamp(v,a,b) if v<a then return a elseif v>b then return b else return v end end
+
+-- WORLD helpers
+local function idxKey(x,y,z) return x..","..y..","..z end
+
+local function createEmptyWorld(w,h,d)
+  local t = {}
+  for x = 1, w do
+    t[x] = {}
+    for y = 1, h do
+      t[x][y] = {}
+      for z = 1, d do
+        t[x][y][z] = 0
+      end
+    end
+  end
+  return t
+end
+
+local function inBounds(x,y,z)
+  return x>=1 and x<=WORLD_W and y>=1 and y<=WORLD_H and z>=1 and z<=WORLD_D
+end
+
+local function getBlock(x,y,z)
+  if not inBounds(x,y,z) then return 0 end
+  return world[x][y][z]
+end
+
+local function setBlock(x,y,z,id, noMark)
+  if not inBounds(x,y,z) then return false end
+  world[x][y][z] = id
+  if not noMark then
+    -- mark affected chunks as dirty
+    local cx = math.floor((x-1)/CHUNK_SIZE)
+    local cz = math.floor((z-1)/CHUNK_SIZE)
+    local key = cx .. "_" .. cz
+    chunks[key] = chunks[key] or {}
+    chunks[key].dirty = true
+    -- also neighbors if on edge
+    if ((x-1) % CHUNK_SIZE) == 0 then
+      local key2 = (cx-1).."_"..cz; chunks[key2]=chunks[key2] or {}; chunks[key2].dirty = true
+    end
+    if ((x-1) % CHUNK_SIZE) == CHUNK_SIZE-1 then
+      local key2 = (cx+1).."_"..cz; chunks[key2]=chunks[key2] or {}; chunks[key2].dirty = true
+    end
+    if ((z-1) % CHUNK_SIZE) == 0 then
+      local key2 = cx.."_"..(cz-1); chunks[key2]=chunks[key2] or {}; chunks[key2].dirty = true
+    end
+    if ((z-1) % CHUNK_SIZE) == CHUNK_SIZE-1 then
+      local key2 = cx.."_"..(cz+1); chunks[key2]=chunks[key2] or {}; chunks[key2].dirty = true
+    end
+  end
+  return true
+end
+
+-- SIMPLE GENERATOR (flat + noise)
+local function generateWorld(seed)
+  seed = seed or os.time()
+  math.randomseed(seed)
+  world = createEmptyWorld(WORLD_W, WORLD_H, WORLD_D)
+  for x=1,WORLD_W do
+    for z=1,WORLD_D do
+      local h = math.floor(WORLD_H*0.25 + (math.noise and math.noise or function() return math.sin((x+z*13)*0.15) end)(x*0.1,z*0.1)*4)
+      h = clamp(h,2,WORLD_H-2)
+      for y=1,h do
+        if y <= h-2 then setBlock(x,y,z,3, true) -- stone
+        elseif y <= h-1 then setBlock(x,y,z,2, true) -- dirt
+        else setBlock(x,y,z,1, true) -- grass
+        end
+      end
+    end
+  end
+  -- mark all chunks dirty to (re)mesh
+  for cx=0, math.floor((WORLD_W-1)/CHUNK_SIZE) do
+    for cz=0, math.floor((WORLD_D-1)/CHUNK_SIZE) do
+      local key = cx.."_"..cz
+      chunks[key] = {dirty=true}
+    end
+  end
+end
+
+-- SAVE / LOAD (serialize world to a Lua file)
+local function serializeWorld()
+  local parts = {"return {"}
+  for x=1,WORLD_W do
+    for y=1,WORLD_H do
+      for z=1,WORLD_D do
+        local id = world[x][y][z]
+        if id ~= 0 then
+          table.insert(parts, string.format("{%d,%d,%d,%d},", x,y,z,id))
+        end
+      end
+    end
+  end
+  table.insert(parts, "}")
+  return table.concat(parts, "\n")
+end
+
+local function saveWorld()
+  local s = serializeWorld()
+  lovr.filesystem.write(SAVE_FILE, s)
+  print("Saved world to", SAVE_FILE)
+end
+
+local function loadWorld()
+  if not lovr.filesystem.getInfo(SAVE_FILE) then return false end
+  local chunk, err = lovr.filesystem.read(SAVE_FILE)
+  if not chunk then print("Load error:", err); return false end
+  local f, err2 = load(chunk)
+  if not f then print("Failed to load:", err2); return false end
+  local entries = f()
+  world = createEmptyWorld(WORLD_W, WORLD_H, WORLD_D)
+  for _, v in ipairs(entries) do
+    setBlock(v[1], v[2], v[3], v[4], true)
+  end
+  -- mark all chunks dirty
+  for cx=0, math.floor((WORLD_W-1)/CHUNK_SIZE) do
+    for cz=0, math.floor((WORLD_D-1)/CHUNK_SIZE) do
+      local key = cx.."_"..cz
+      chunks[key] = {dirty=true}
+    end
+  end
+  print("Loaded world from", SAVE_FILE)
+  return true
+end
+
+-- MESHING: create mesh for chunk by iterating visible faces (simple)
+local function makeChunkMesh(cx, cz)
+  local startX = cx*CHUNK_SIZE + 1
+  local startZ = cz*CHUNK_SIZE + 1
+  local verts = {}
+  local indices = {}
+  local idx = 1
+
+  local function addFace(wx,wy,wz, nx,ny,nz, size, color, tex)
+    -- quad with 4 vertices, we create a simple cube-face. Vertex format: x,y,z,nx,ny,nz,u,v,r,g,b,a
+    -- We use a simple layout for lovr.graphics.newMesh: each vertex is a table
+    local s = size / 2
+    -- determine two axes for the face
+    local ux,uy,uz, vx,vy,vz
+    if nx ~= 0 then ux,uy,uz = 0,1,0; vx,vy,vz = 0,0,1
+    elseif ny ~= 0 then ux,uy,uz = 1,0,0; vx,vy,vz = 0,0,1
+    else ux,uy,uz = 1,0,0; vx,vy,vz = 0,1,0 end
+
+    -- compute four corners
+    local v1 = {wx - s*ux - s*vx, wy - s*uy - s*vy, wz - s*uz - s*vz}
+    local v2 = {wx + s*ux - s*vx, wy + s*uy - s*vy, wz + s*uz - s*vz}
+    local v3 = {wx + s*ux + s*vx, wy + s*uy + s*vy, wz + s*uz + s*vz}
+    local v4 = {wx - s*ux + s*vx, wy - s*uy + s*vy, wz - s*uz + s*vz}
+    local colorRGBA = {color[1], color[2], color[3], 1}
+    -- uvs simple full 0..1
+    local uvs = {{0,0},{1,0},{1,1},{0,1}}
+    -- push vertices
+    table.insert(verts, {v1[1],v1[2],v1[3], nx,ny,nz, uvs[1][1],uvs[1][2], colorRGBA[1],colorRGBA[2],colorRGBA[3],colorRGBA[4]})
+    table.insert(verts, {v2[1],v2[2],v2[3], nx,ny,nz, uvs[2][1],uvs[2][2], colorRGBA[1],colorRGBA[2],colorRGBA[3],colorRGBA[4]})
+    table.insert(verts, {v3[1],v3[2],v3[3], nx,ny,nz, uvs[3][1],uvs[3][2], colorRGBA[1],colorRGBA[2],colorRGBA[3],colorRGBA[4]})
+    table.insert(verts, {v4[1],v4[2],v4[3], nx,ny,nz, uvs[4][1],uvs[4][2], colorRGBA[1],colorRGBA[2],colorRGBA[3],colorRGBA[4]})
+    -- indices (two triangles)
+    table.insert(indices, idx); table.insert(indices, idx+1); table.insert(indices, idx+2)
+    table.insert(indices, idx); table.insert(indices, idx+2); table.insert(indices, idx+3)
+    idx = idx + 4
+  end
+
+  for x=startX, math.min(startX+CHUNK_SIZE-1, WORLD_W) do
+    for z=startZ, math.min(startZ+CHUNK_SIZE-1, WORLD_D) do
+      for y=1, WORLD_H do
+        local id = getBlock(x,y,z)
+        if id ~= 0 then
+          local posx = (x-1) - WORLD_W/2
+          local posy = (y-1)
+          local posz = (z-1) - WORLD_D/2
+          local preset = BLOCKS[id] or BLOCKS[1] or {color={1,1,1}}
+          -- for each of 6 directions, add face if neighbor is empty
+          if getBlock(x+1,y,z) == 0 then addFace(posx+0.5, posy+0.5, posz+0.5, 1,0,0,1, preset.color) end
+          if getBlock(x-1,y,z) == 0 then addFace(posx-0.5, posy+0.5, posz+0.5, -1,0,0,1, preset.color) end
+          if getBlock(x,y+1,z) == 0 then addFace(posx+0.5, posy+1.5, posz+0.5, 0,1,0,1, preset.color) end
+          if getBlock(x,y-1,z) == 0 then addFace(posx+0.5, posy-0.5, posz+0.5, 0,-1,0,1, preset.color) end
+          if getBlock(x,y,z+1) == 0 then addFace(posx+0.5, posy+0.5, posz+1.5, 0,0,1,1, preset.color) end
+          if getBlock(x,y,z-1) == 0 then addFace(posx+0.5, posy+0.5, posz-0.5, 0,0,-1,1, preset.color) end
+        end
+      end
+    end
+  end
+
+  -- create lovr mesh if we have vertices
+  if #verts == 0 then
+    return nil
+  end
+
+  -- vertex format: {"float","float","float","float","float","float","float","float","float","float","float","float"} (pos,norm,uv,color rgba)
+  local format = {
+    {"float","float","float"}, -- position
+    {"float","float","float"}, -- normal
+    {"float","float"},         -- uv
+    {"float","float","float","float"} -- color
+  }
+  local meshData = lovr.graphics.newMesh(verts, "triangles", "static", format)
+  meshData:setVertexMap(indices)
+  return meshData
+end
+
+-- update chunk meshes if dirty
+local function updateChunks()
+  for cx=0, math.floor((WORLD_W-1)/CHUNK_SIZE) do
+    for cz=0, math.floor((WORLD_D-1)/CHUNK_SIZE) do
+      local key = cx.."_"..cz
+      local c = chunks[key]
+      if c and c.dirty then
+        if c.mesh and c.mesh:isReleased() == false then
+          c.mesh:release()
+        end
+        local mesh = makeChunkMesh(cx, cz)
+        c.mesh = mesh
+        c.dirty = false
+        c.cx = cx; c.cz = cz
+      end
+    end
+  end
+end
+
+-- RAYCAST into voxel world using a stepping algorithm
+local function raycast(origin, dir, maxdist, step)
+  maxdist = maxdist or 64
+  step = step or 0.2
+  local t = 0
+  while t <= maxdist do
+    local px = origin.x + dir.x * t
+    local py = origin.y + dir.y * t
+    local pz = origin.z + dir.z * t
+    -- convert world pos to voxel coords
+    local vx = math.floor(px + WORLD_W/2) + 1
+    local vy = math.floor(py) + 1
+    local vz = math.floor(pz + WORLD_D/2) + 1
+    if inBounds(vx,vy,vz) and getBlock(vx,vy,vz) ~= 0 then
+      return vx,vy,vz, t
+    end
+    t = t + step
+  end
+  return nil
+end
+
+-- UNRELIABLE: try require enet; if fails, fallback single-player
+local function tryInitNetwork()
+  if not try_load_enet then return end
+  local ok, m = pcall(require, "enet")
+  if not ok then
+    print("enet not available; multiplayer disabled. Install lua-enet to enable multiplayer.")
+    enet = nil
+    return
+  end
+  enet = m
+  print("enet loaded; multiplayer available.")
+end
+
+-- send block action over network
+local function netSend(msg)
+  if not enet or not net_peer then return end
+  net_peer:send(msg)
+end
+
+-- process incoming network message (server or client)
+local function handleNetMessage(msg, sender_peer)
+  -- simple protocol:
+  -- PLACE x y z id
+  -- REMOVE x y z
+  -- POS x y z yaw pitch (player positions)  -- optional
+  local parts = {}
+  for token in msg:gmatch("%S+") do table.insert(parts, token) end
+  local cmd = parts[1]
+  if cmd == "PLACE" and #parts >= 5 then
+    local x = tonumber(parts[2]); local y = tonumber(parts[3]); local z = tonumber(parts[4]); local id = tonumber(parts[5])
+    if x and y and z and id then
+      setBlock(x,y,z,id)
+      -- if server, broadcast to others
+      if is_server and net_host then
+        for peer in net_host:clients() do
+          if peer ~= sender_peer then peer:send(msg) end
+        end
+      end
+    end
+  elseif cmd == "REMOVE" and #parts >= 4 then
+    local x = tonumber(parts[2]); local y = tonumber(parts[3]); local z = tonumber(parts[4])
+    if x and y and z then
+      setBlock(x,y,z,0)
+      if is_server and net_host then
+        for peer in net_host:clients() do
+          if peer ~= sender_peer then peer:send(msg) end
+        end
+      end
+    end
+  end
+end
+
+-- place block at ray-hit adjacency
+local function placeAtLook()
+  local ox = player.x - WORLD_W/2
+  local oy = player.y
+  local oz = player.z - WORLD_D/2
+  local forward = {
+    x = math.cos(player.yaw) * math.cos(player.pitch),
+    y = math.sin(player.pitch),
+    z = math.sin(player.yaw) * math.cos(player.pitch)
+  }
+  local hx,hy,hz,dist = raycast({x=ox,y=oy,z=oz}, forward, 32, 0.2)
+  if not hx then
+    -- place in front some distance
+    local px = player.x + forward.x * 3
+    local py = player.y + forward.y * 3
+    local pz = player.z + forward.z * 3
+    local vx = math.floor(px + WORLD_W/2) + 1
+    local vy = math.floor(py) + 1
+    local vz = math.floor(pz + WORLD_D/2) + 1
+    if inBounds(vx,vy,vz) and getBlock(vx,vy,vz) == 0 then
+      setBlock(vx,vy,vz, selectedBlock)
+      netSend(string.format("PLACE %d %d %d %d", vx,vy,vz, selectedBlock))
+    end
+    return
+  end
+  -- compute neighbor cell in direction of the ray (approx)
+  local nx = hx; local ny = hy; local nz = hz
+  -- step a bit along forward to find adjacent cell
+  local stepBackX = math.floor((player.x - WORLD_W/2 + forward.x * dist) + forward.x*0.6) + 1
+  -- simpler: try the six neighbors for an empty
+  local tryNeighbors = {
+    {1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}
+  }
+  for _, n in ipairs(tryNeighbors) do
+    local tx,ty,tz = hx + n[1], hy + n[2], hz + n[3]
+    if inBounds(tx,ty,tz) and getBlock(tx,ty,tz) == 0 then
+      setBlock(tx,ty,tz, selectedBlock)
+      netSend(string.format("PLACE %d %d %d %d", tx,ty,tz, selectedBlock))
+      return
+    end
+  end
+end
+
+local function removeAtLook()
+  local ox = player.x - WORLD_W/2
+  local oy = player.y
+  local oz = player.z - WORLD_D/2
+  local forward = {
+    x = math.cos(player.yaw) * math.cos(player.pitch),
+    y = math.sin(player.pitch),
+    z = math.sin(player.yaw) * math.cos(player.pitch)
+  }
+  local hx,hy,hz,dist = raycast({x=ox,y=oy,z=oz}, forward, 32, 0.2)
+  if hx then
+    setBlock(hx,hy,hz, 0)
+    netSend(string.format("REMOVE %d %d %d", hx,hy,hz))
+  end
+end
+
+-- LOAD optional textures
+local function loadTextures()
+  for id,_ in pairs(BLOCKS) do
+    if id ~= 0 then
+      local path = "assets/textures/"..tostring(id)..".png"
+      if lovr.filesystem.getInfo(path) then
+        local ok, img = pcall(lovr.graphics.newTexture, path)
+        if ok then textures[id] = img end
+      end
+    end
+  end
+end
+
+-- INITIALIZATION
+function lovr.load(args)
+  print("LÖVR voxel sandbox starting...")
+  tryInitNetwork()
+  -- try to load saved world, else generate
+  if not loadWorld() then
+    generateWorld()
+  end
+  loadTextures()
+  -- ensure all chunks exist
+  for cx=0, math.floor((WORLD_W-1)/CHUNK_SIZE) do
+    for cz=0, math.floor((WORLD_D-1)/CHUNK_SIZE) do
+      local key = cx.."_"..cz
+      chunks[key] = chunks[key] or {dirty=true}
+    end
+  end
+  updateChunks()
+
+  -- parse args for server or client mode
+  local mode = nil
+  if #args > 0 then mode = args[1] end
+  if mode == "server" and enet then
+    is_server = true
+    net_host = enet.host_create("*:6789")
+    if net_host then print("Server started on port 6789") end
+  elseif mode == "client" and enet then
+    local host, port = "127.0.0.1", "6789"
+    net_host = enet.host_create()
+    net_peer = net_host:connect(host..":"..port)
+    print("Connecting to server at "..host..":"..port)
+  else
+    print("Running single-player (run with 'server' or 'client' arg to enable enet multiplayer if available).")
+  end
+
+  lovr.mouse.setRelativeMode(true)
+  lovr.graphics.setBackgroundColor(0.6,0.8,1.0)
+end
+
+-- INPUT
+function lovr.keypressed(key)
+  if key == 'escape' then lovr.event.quit() end
+  if key == 'space' then
+    if player.fly then player.y = player.y + 1 else player.y = player.y + 1 end
+  end
+  if key == 'r' then
+    generateWorld()
+    updateChunks()
+  end
+  if key == 'f5' then saveWorld() end
+  if key == 'f9' then loadWorld(); updateChunks() end
+  if key == 'tab' then player.fly = not player.fly end
+  if key == 'e' then placeAtLook() end
+  if key == 'q' then removeAtLook() end
+  -- change selected
+  if key >= '1' and key <= '9' then
+    local n = tonumber(key)
+    if BLOCKS[n] then selectedBlock = n end
+  end
+  -- networking shortcuts
+  if key == 'p' and not is_server and enet then
+    -- connect to localhost if not connected
+    if not net_peer then
+      net_host = enet.host_create()
+      net_peer = net_host:connect("127.0.0.1:6789")
+    end
+  end
+end
+
+function lovr.update(dt)
+  -- networking poll
+  if enet and net_host then
+    local event = net_host:service(0)
+    while event do
+      if event.type == "receive" then
+        handleNetMessage(event.data, event.peer)
+      elseif event.type == "connect" then
+        print("Connected peer:", event.peer)
+      elseif event.type == "disconnect" then
+        print("Peer disconnected")
+      end
+      event = net_host:service(0)
+    end
+  end
+
+  -- update chunks if dirty
+  updateChunks()
+
+  -- player movement
+  local dx, dz = 0, 0
+  if lovr.keyboard.isDown('w') then dz = dz - 1 end
+  if lovr.keyboard.isDown('s') then dz = dz + 1 end
+  if lovr.keyboard.isDown('a') then dx = dx - 1 end
+  if lovr.keyboard.isDown('d') then dx = dx + 1 end
+  local len = math.sqrt(dx*dx + dz*dz)
+  if len > 0 then
+    dx, dz = dx/len, dz/len
+  end
+  local forward = {x = math.cos(player.yaw), z = math.sin(player.yaw)}
+  local right = {x = math.cos(player.yaw + math.pi/2), z = math.sin(player.yaw + math.pi/2)}
+  player.x = player.x + ((forward.x*dz + right.x*dx) * player.speed * dt)
+  player.z = player.z + ((forward.z*dz + right.z*dx) * player.speed * dt)
+  if player.fly then
+    if lovr.keyboard.isDown('space') then player.y = player.y + player.speed*dt end
+    if lovr.keyboard.isDown('lshift') then player.y = player.y - player.speed*dt end
+  else
+    -- basic gravity
+    player.y = math.max(1, player.y - 9.8 * dt)
+  end
+
+  -- mouse look
+  local mx,my = lovr.mouse.getDelta()
+  player.yaw = player.yaw - mx * 0.002
+  player.pitch = clamp(player.pitch - my * 0.002, -math.pi/2 + 0.01, math.pi/2 - 0.01)
+end
+
+-- DRAW
+function lovr.draw(pass)
+  -- draw world chunks that are near player
+  local px = player.x - WORLD_W/2
+  local pz = player.z - WORLD_D/2
+  lovr.graphics.push()
+  -- apply camera
+  lovr.graphics.rotate(-player.pitch, 1,0,0)
+  lovr.graphics.rotate(-player.yaw, 0,1,0)
+  lovr.graphics.translate(-player.x + WORLD_W/2, -player.y, -player.z + WORLD_D/2)
+
+  for key,c in pairs(chunks) do
+    if c.mesh then
+      -- compute chunk world center for distance culling
+      local cx = c.cx; local cz = c.cz
+      local centerx = (cx*CHUNK_SIZE + CHUNK_SIZE/2 - 0.5) - WORLD_W/2
+      local centerz = (cz*CHUNK_SIZE + CHUNK_SIZE/2 - 0.5) - WORLD_D/2
+      local dist = math.sqrt((centerx - px)^2 + (centerz - pz)^2)
+      if dist < MAX_VIEW_DISTANCE then
+        lovr.graphics.draw(c.mesh)
+      end
+    end
+  end
+
+  lovr.graphics.pop()
+
+  -- UI overlay: inventory, instructions
+  lovr.graphics.origin()
+  lovr.graphics.setColor(1,1,1)
+  lovr.graphics.print(string.format("Pos: (%.2f, %.2f, %.2f)  Yaw: %.2f  Pitch: %.2f  Sel: %d (%s)",
+    player.x, player.y, player.z, player.yaw, player.pitch, selectedBlock, BLOCKS[selectedBlock] and BLOCKS[selectedBlock].name or "N/A"), 0.02, 0.96, 0.02)
+
+  local invText = "Inventory: "
+  for id,count in pairs(inventory) do
+    invText = invText .. string.format("[%d:%s x%d] ", id, BLOCKS[id] and BLOCKS[id].name or "?", count)
+  end
+  lovr.graphics.print(invText, 0.02, 0.92, 0.02)
+
+  lovr.graphics.print("WASD move | Mouse look | E place | Q remove | 1-9 select | F5 save | F9 load | R regen", 0.02, 0.88, 0.02)
+  if enet then
+    lovr.graphics.print(is_server and "Multiplayer: SERVER running on port 6789" or (net_peer and "Multiplayer: connected" or "Multiplayer: client (press P to connect)"), 0.02, 0.84, 0.02)
+  else
+    lovr.graphics.print("Multiplayer unavailable (enet not installed)", 0.02, 0.84, 0.02)
+  end
+
+  -- crosshair
+  lovr.graphics.setColor(1,1,1)
+  lovr.graphics.points(0.5, 0.5)
+end
+
+-- MOUSE BUTTONS
+function lovr.mousepressed(x,y, button)
+  if button == 1 then removeAtLook()
+  elseif button == 2 then placeAtLook() end
+end
+
+-- CLEANUP on exit
+function lovr.quit()
+  -- save automatically
+  saveWorld()
+  print("Quitting. World saved.")
+end
